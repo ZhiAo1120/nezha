@@ -292,11 +292,15 @@ pub async fn generate_commit_message(project_path: String) -> Result<String, Str
         commit_prompt, diff
     );
 
-    // 4. Run agent in non-interactive exec mode
-    let output = tokio::task::spawn_blocking(move || {
-        run_agent_commit_message_command(&agent, &project_path, &full_prompt)
-    })
+    // 4. Run agent in non-interactive exec mode with 2 minute timeout
+    let output = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::task::spawn_blocking(move || {
+            run_agent_commit_message_command(&agent, &project_path, &full_prompt)
+        }),
+    )
     .await
+    .map_err(|_| "生成提交信息超时（2分钟）".to_string())?
     .map_err(|e| format!("生成提交信息线程错误: {}", e))??;
 
     if !output.status.success() {
