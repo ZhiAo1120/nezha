@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
@@ -181,6 +182,44 @@ fn apply_login_shell_env(cmd: &mut Command) {
     }
 }
 
+fn run_command_with_prompt_stdin(
+    mut cmd: Command,
+    agent: &str,
+    prompt: &str,
+) -> Result<Output, String> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to run {agent}: {e}"))?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("Failed to open {agent} stdin"))?;
+        if let Err(e) = stdin.write_all(prompt.as_bytes()) {
+            // If the child exits early (for example because the CLI is not authenticated),
+            // still wait for its output so the caller can surface the real CLI error.
+            if e.kind() != ErrorKind::BrokenPipe {
+                return Err(format!("Failed to write prompt to {agent} stdin: {e}"));
+            }
+        }
+    }
+
+    child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for {agent}: {e}"))
+}
+
+fn configure_agent_command_base(cmd: &mut Command, project_path: &str) {
+    crate::subprocess::configure_background_command(cmd);
+    cmd.current_dir(project_path);
+    apply_login_shell_env(cmd);
+}
+
 fn run_agent_commit_message_command(
     agent: &str,
     project_path: &str,
@@ -188,52 +227,33 @@ fn run_agent_commit_message_command(
 ) -> Result<Output, String> {
     let launch = crate::app_settings::get_agent_launch_spec(agent);
 
-    // Claude: pipe prompt via stdin to avoid Windows command-line length limit.
-    // Codex: pass prompt as argument (exec reads args, not stdin).
-    let (shell_cmd, use_stdin) = if agent == "codex" {
-        #[cfg(windows)]
-        let cmd = format!("\"{}\" exec {} 2>nul", launch.program, prompt);
-        #[cfg(not(windows))]
-        let cmd = format!("\"{}\" exec {} 2>/dev/null", launch.program, prompt);
-        (cmd, false)
-    } else {
-        #[cfg(windows)]
-        let cmd = format!("\"{}\" -p --output-format text 2>nul", launch.program);
-        #[cfg(not(windows))]
-        let cmd = format!("\"{}\" -p --output-format text 2>/dev/null", launch.program);
-        (cmd, true)
-    };
+    if agent == "codex" {
+        let mut cmd = Command::new(&launch.program);
+        configure_agent_command_base(&mut cmd, project_path);
+        for (key, value) in &launch.extra_env {
+            cmd.env(key, value);
+        }
+        // Avoid Windows command-line length limits by passing the full prompt over stdin.
+        // Current Codex CLI supports `codex exec -` to read the task prompt from stdin.
+        cmd.args(["exec", "-"]);
+        return run_command_with_prompt_stdin(cmd, agent, prompt);
+    }
 
-    let mut cmd = Command::new("sh");
-    crate::subprocess::configure_background_command(&mut cmd);
-    cmd.args(["-c", &shell_cmd]);
-    cmd.current_dir(project_path);
-    apply_login_shell_env(&mut cmd);
+    let mut cmd = Command::new(&launch.program);
+    configure_agent_command_base(&mut cmd, project_path);
     for (key, value) in &launch.extra_env {
         cmd.env(key, value);
     }
-
-    if use_stdin {
-        cmd.stdin(Stdio::piped());
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to run {agent}: {e}"))?;
-
-    if use_stdin {
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin
-                .write_all(prompt.as_bytes())
-                .map_err(|e| format!("Failed to write to {agent} stdin: {e}"))?;
-            drop(stdin);
-        }
-    }
-
-    child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to collect {agent} output: {e}"))
+    // Claude Code supports piped stdin in print mode. Keep only a short driver prompt
+    // on the command line and send the large diff/request through stdin so Windows never
+    // sees the diff as a command-line argument or shell-redirection file name.
+    cmd.args([
+        "-p",
+        "Read the complete commit-message request from standard input, follow it exactly, and output only the commit message.",
+        "--output-format",
+        "text",
+    ]);
+    run_command_with_prompt_stdin(cmd, agent, prompt)
 }
 
 fn create_empty_temp_file() -> Result<PathBuf, String> {
@@ -272,15 +292,11 @@ pub async fn generate_commit_message(project_path: String) -> Result<String, Str
         commit_prompt, diff
     );
 
-    // 4. Run agent in non-interactive exec mode with 15 second timeout
-    let output = tokio::time::timeout(
-        Duration::from_secs(15),
-        tokio::task::spawn_blocking(move || {
-            run_agent_commit_message_command(&agent, &project_path, &full_prompt)
-        }),
-    )
+    // 4. Run agent in non-interactive exec mode
+    let output = tokio::task::spawn_blocking(move || {
+        run_agent_commit_message_command(&agent, &project_path, &full_prompt)
+    })
     .await
-    .map_err(|_| "生成提交信息超时（15秒）".to_string())?
     .map_err(|e| format!("生成提交信息线程错误: {}", e))??;
 
     if !output.status.success() {
