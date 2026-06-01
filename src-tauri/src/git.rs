@@ -187,21 +187,53 @@ fn run_agent_commit_message_command(
     prompt: &str,
 ) -> Result<Output, String> {
     let launch = crate::app_settings::get_agent_launch_spec(agent);
-    let mut cmd = Command::new(&launch.program);
-    crate::subprocess::configure_background_command(&mut cmd);
-    if agent == "codex" {
-        cmd.args(["exec", prompt]);
+
+    // Claude: pipe prompt via stdin to avoid Windows command-line length limit.
+    // Codex: pass prompt as argument (exec reads args, not stdin).
+    let (shell_cmd, use_stdin) = if agent == "codex" {
+        #[cfg(windows)]
+        let cmd = format!("\"{}\" exec {} 2>nul", launch.program, prompt);
+        #[cfg(not(windows))]
+        let cmd = format!("\"{}\" exec {} 2>/dev/null", launch.program, prompt);
+        (cmd, false)
     } else {
-        cmd.args(["-p", prompt, "--output-format", "text"]);
-    }
+        #[cfg(windows)]
+        let cmd = format!("\"{}\" -p --output-format text 2>nul", launch.program);
+        #[cfg(not(windows))]
+        let cmd = format!("\"{}\" -p --output-format text 2>/dev/null", launch.program);
+        (cmd, true)
+    };
+
+    let mut cmd = Command::new("sh");
+    crate::subprocess::configure_background_command(&mut cmd);
+    cmd.args(["-c", &shell_cmd]);
     cmd.current_dir(project_path);
-    cmd.stdin(Stdio::null());
     apply_login_shell_env(&mut cmd);
     for (key, value) in &launch.extra_env {
         cmd.env(key, value);
     }
-    cmd.output()
-        .map_err(|e| format!("Failed to run {agent}: {e}"))
+
+    if use_stdin {
+        cmd.stdin(Stdio::piped());
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to run {agent}: {e}"))?;
+
+    if use_stdin {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin
+                .write_all(prompt.as_bytes())
+                .map_err(|e| format!("Failed to write to {agent} stdin: {e}"))?;
+            drop(stdin);
+        }
+    }
+
+    child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to collect {agent} output: {e}"))
 }
 
 fn create_empty_temp_file() -> Result<PathBuf, String> {
@@ -222,7 +254,7 @@ pub async fn generate_commit_message(project_path: String) -> Result<String, Str
         return Err("No staged changes to generate a commit message for.".to_string());
     }
 
-    // Truncate diff if too large to avoid CLI arg limits
+    // Truncate diff if too large to keep agent context manageable
     let diff = if diff.len() > 50_000 {
         format!("{}...(diff truncated)", &diff[..50_000])
     } else {
@@ -1007,34 +1039,60 @@ pub async fn git_show_file_diff(
 #[tauri::command]
 pub async fn git_push(project_path: String, branch: Option<String>) -> Result<String, String> {
     let mut args = vec!["push".to_string()];
+    let push_branch = branch
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            // Resolve current branch name for the success message
+            String::new()
+        });
     if let Some(ref b) = branch.filter(|s| !s.is_empty()) {
         args.push("origin".to_string());
         args.push(b.clone());
     }
     let output = run_git(&project_path, &args)?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
-        return Err(combined);
+        let combined = format!("{}{}", stdout, stderr);
+        return Err(combined.trim().to_string());
     }
-    Ok(combined.trim().to_string())
+
+    // Resolve branch name for the success message
+    let branch_display = if !push_branch.is_empty() {
+        push_branch
+    } else {
+        let branch_out = run_git(&project_path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        match branch_out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .to_string(),
+            _ => "origin".to_string(),
+        }
+    };
+
+    Ok(branch_display)
 }
 
 #[tauri::command]
 pub async fn git_pull(project_path: String) -> Result<String, String> {
     let output = run_git(&project_path, &["pull"])?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
-        return Err(combined);
+        let combined = format!("{}{}", stdout, stderr);
+        return Err(combined.trim().to_string());
     }
-    Ok(combined.trim().to_string())
+
+    // Resolve current branch name for the success message
+    let branch_display = match run_git(&project_path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    };
+
+    Ok(branch_display)
 }
 
 #[derive(serde::Serialize)]
