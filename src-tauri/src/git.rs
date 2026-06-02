@@ -377,8 +377,23 @@ pub async fn git_status(project_path: String) -> Result<Vec<GitFileChange>, Stri
         "status".to_string(),
         "--porcelain=v1".to_string(),
         "-z".to_string(),
+        "--untracked-files=all".to_string(),
     ];
+
     let output = run_git_with_timeout(project_path, args, Duration::from_secs(5)).await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!("{}{}", stderr, stdout).trim().to_string();
+
+        return Err(if message.is_empty() {
+            "Failed to get git status".to_string()
+        } else {
+            message
+        });
+    }
+
     Ok(parse_porcelain_z_status(&output.stdout))
 }
 
@@ -1445,9 +1460,9 @@ fn accumulate_numstat(stdout: &[u8], additions: &mut i32, deletions: &mut i32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        git_has_head, git_worktree_root, is_protected_project_relative_path, list_untracked_files,
-        parse_porcelain_z_status, path_to_string, run_git_check, untracked_files_under_directory,
-        GitFileChange,
+        git_has_head, git_status, git_worktree_root, is_protected_project_relative_path,
+        list_untracked_files, parse_porcelain_z_status, path_to_string, run_git_check,
+        untracked_files_under_directory, GitFileChange,
     };
     use std::{fs, path::PathBuf, process::Command};
 
@@ -1567,6 +1582,24 @@ mod tests {
         let resolved = git_worktree_root(nested_project.to_str().unwrap()).unwrap();
 
         assert_eq!(resolved, repo.path.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn git_status_expands_untracked_directories() {
+        let repo = TempRepo::new();
+        let repo_path = repo.path_string();
+
+        let nested_dir = repo.path.join("src/components");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::write(nested_dir.join("Button.tsx"), "component").unwrap();
+        fs::write(repo.path.join("src/index.ts"), "index").unwrap();
+
+        let changes = git_status(repo_path).await.unwrap();
+        let paths: Vec<&str> = changes.iter().map(|change| change.path.as_str()).collect();
+
+        assert!(paths.contains(&"src/components/Button.tsx"));
+        assert!(paths.contains(&"src/index.ts"));
+        assert!(!paths.contains(&"src/"));
     }
 
     #[test]
