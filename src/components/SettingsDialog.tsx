@@ -14,14 +14,10 @@ interface ProjectConfig {
     claude_version: string;
     codex_version: string;
   };
-  git: {
-    commit_prompt: string;
-    commit_message_timeout_secs: number;
-  };
+  git: { commit_prompt: string };
 }
 
 const PERMISSION_MODES: PermissionMode[] = ["ask", "auto_edit", "full_access"];
-const DEFAULT_COMMIT_MESSAGE_TIMEOUT_SECS = 15;
 
 interface AgentVersions {
   claude_version: string;
@@ -88,9 +84,6 @@ function ProjectSettings({ projectPath, onClose }: { projectPath: string; onClos
   const [defaultPermissionMode, setDefaultPermissionMode] = useState<PermissionMode>("ask");
   const [promptPrefix, setPromptPrefix] = useState("");
   const [commitPrompt, setCommitPrompt] = useState("");
-  const [commitMessageTimeoutSecs, setCommitMessageTimeoutSecs] = useState(
-    String(DEFAULT_COMMIT_MESSAGE_TIMEOUT_SECS),
-  );
   const [claudeVersion, setClaudeVersion] = useState("");
   const [codexVersion, setCodexVersion] = useState("");
   const [detecting, setDetecting] = useState(false);
@@ -108,9 +101,6 @@ function ProjectSettings({ projectPath, onClose }: { projectPath: string; onClos
         }
         setPromptPrefix(c.agent.prompt_prefix ?? "");
         setCommitPrompt(c.git.commit_prompt);
-        setCommitMessageTimeoutSecs(
-          String(c.git.commit_message_timeout_secs ?? DEFAULT_COMMIT_MESSAGE_TIMEOUT_SECS),
-        );
         setClaudeVersion(c.agent.claude_version ?? "");
         setCodexVersion(c.agent.codex_version ?? "");
 
@@ -139,12 +129,6 @@ function ProjectSettings({ projectPath, onClose }: { projectPath: string; onClos
     setSaving(true);
     setError(null);
     try {
-      const timeoutSecs = Number(commitMessageTimeoutSecs);
-      if (!Number.isInteger(timeoutSecs) || timeoutSecs < 1) {
-        setError(t("settings.commitMessageTimeoutInvalid"));
-        return;
-      }
-
       await invoke("write_project_config", {
         projectPath,
         config: {
@@ -155,10 +139,7 @@ function ProjectSettings({ projectPath, onClose }: { projectPath: string; onClos
             claude_version: claudeVersion,
             codex_version: codexVersion,
           },
-          git: {
-            commit_prompt: commitPrompt,
-            commit_message_timeout_secs: timeoutSecs,
-          },
+          git: { commit_prompt: commitPrompt },
         },
       });
       onClose();
@@ -281,22 +262,6 @@ function ProjectSettings({ projectPath, onClose }: { projectPath: string; onClos
 
             <div style={s.modalSection}>
               <div style={s.modalSectionTitle}>{t("settings.git")}</div>
-              <div style={s.modalField}>
-                <label style={s.modalLabel}>
-                  {t("settings.commitMessageTimeout")}
-                  <span style={s.modalLabelHint}>
-                    {t("settings.commitMessageTimeoutHint")}
-                  </span>
-                </label>
-                <input
-                  style={s.modalInput}
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={commitMessageTimeoutSecs}
-                  onChange={(e) => setCommitMessageTimeoutSecs(e.target.value)}
-                />
-              </div>
               <div style={s.modalField}>
                 <label style={s.modalLabel}>
                   {t("settings.commitPrompt")}
