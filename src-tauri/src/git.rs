@@ -220,6 +220,19 @@ fn configure_agent_command_base(cmd: &mut Command, project_path: &str) {
     apply_login_shell_env(cmd);
 }
 
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    format!("{}...(diff truncated)", &s[..end])
+}
+
 fn run_agent_commit_message_command(
     agent: &str,
     project_path: &str,
@@ -274,12 +287,8 @@ pub async fn generate_commit_message(project_path: String) -> Result<String, Str
         return Err("No staged changes to generate a commit message for.".to_string());
     }
 
-    // Truncate diff if too large to keep agent context manageable
-    let diff = if diff.len() > 50_000 {
-        format!("{}...(diff truncated)", &diff[..50_000])
-    } else {
-        diff
-    };
+    // Truncate diff safely at a UTF-8 boundary.
+    let diff = truncate_utf8(&diff, 50_000);
 
     // 2. Read project config for prompt and default agent
     let config = crate::config::read_project_config(project_path.clone())?;
